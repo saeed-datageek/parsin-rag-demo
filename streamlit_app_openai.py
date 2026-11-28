@@ -4,7 +4,7 @@ import re
 import sys
 import logging
 from pathlib import Path
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 
 # ── Linux / Streamlit Cloud SQLite3 Compatibility Shim for ChromaDB ──────────
 try:
@@ -150,9 +150,66 @@ def to_persian_digits(number_str: Any) -> str:
     return re.sub(r'\d', lambda m: fa_digits[int(m.group(0))], str(number_str))
 
 
+def normalize_persian(text: str) -> str:
+    """Normalize Arabic/Persian characters and whitespace for reliable matching."""
+    if not text:
+        return ""
+    s = str(text)
+    s = s.replace("ي", "ی").replace("ك", "ک").replace("\u200c", " ")
+    fa_to_en = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
+    s = s.translate(fa_to_en)
+    return re.sub(r"\s+", " ", s).strip().lower()
+
+
+def clean_bbcode(text: str) -> str:
+    """Remove custom color BBCode tags ([green], [blue], [red], etc.) from product descriptions."""
+    if not text:
+        return ""
+    return re.sub(r"\[/?[a-zA-Z]+\]", "", str(text)).strip()
+
+
+def compute_product_pricing(product: Dict[str, Any]) -> Tuple[int, int, int]:
+    """
+    Return (final_price, original_price, discount_percent) matching the React frontend logic.
+    """
+    price_raw = product.get("price", 0)
+    try:
+        original_price = int(float(price_raw or 0))
+    except (ValueError, TypeError):
+        original_price = 0
+
+    discount_obj = product.get("current_discount")
+    discount_pct = 0
+    if isinstance(discount_obj, dict) and discount_obj.get("is_active"):
+        try:
+            discount_pct = int(float(discount_obj.get("discount_percentage") or 0))
+        except (ValueError, TypeError):
+            discount_pct = 0
+
+    if discount_pct > 0 and original_price > 0:
+        final_price = int(round(original_price * (1.0 - discount_pct / 100.0)))
+    else:
+        final_price = original_price
+
+    return final_price, original_price, discount_pct
+
+
+def compute_in_stock(product: Dict[str, Any]) -> Tuple[bool, int]:
+    """Return (in_stock, stock_count) accurately from product payload."""
+    if "stock" in product:
+        try:
+            cnt = int(product.get("stock") or 0)
+            return cnt > 0, max(0, cnt)
+        except (ValueError, TypeError):
+            in_s = bool(product.get("stock"))
+            return in_s, (1 if in_s else 0)
+    in_s = bool(product.get("in_stock", True))
+    return in_s, (1 if in_s else 0)
+
+
 # ── Standalone OpenAI ChromaDB Setup ─────────────────────────────────────────
 class OpenAIEmbeddingFunction(EmbeddingFunction[Documents]):
-    """ChromaDB embedding function connecting to OpenAI Embeddings API."""
+    """ChromaDB embedding function connecting to OpenAI Embeddings API without silent zero-vector poisoning."""
 
     def __init__(
         self,
@@ -170,30 +227,27 @@ class OpenAIEmbeddingFunction(EmbeddingFunction[Documents]):
     def __call__(self, input: Documents) -> Embeddings:
         if isinstance(input, str):
             input = [input]
-        dim = EMBEDDING_DIMS.get(self.model, 1536)
         if not self.api_key:
-            return [[0.0] * dim for _ in input]
-        try:
-            resp = requests.post(
-                f"{self.base_url}/embeddings",
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={"model": self.model, "input": list(input)},
-                timeout=60,
-            )
-            if resp.ok:
-                data = resp.json()
-                items = sorted(data.get("data", []), key=lambda x: x.get("index", 0))
-                embeddings = [item.get("embedding", []) for item in items if item.get("embedding")]
-                if embeddings and len(embeddings) == len(input):
-                    return embeddings
-            else:
-                logger.warning(f"[OpenAI Embedding] HTTP {resp.status_code}: {resp.text[:250]}")
-        except Exception as e:
-            logger.warning(f"[OpenAI Embedding] Request failed: {e}")
-        return [[0.0] * dim for _ in input]
+            raise ValueError("OPENAI_API_KEY تنظیم نشده است.")
+
+        resp = requests.post(
+            f"{self.base_url}/embeddings",
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            json={"model": self.model, "input": list(input)},
+            timeout=60,
+        )
+        if not resp.ok:
+            raise RuntimeError(f"OpenAI Embeddings HTTP {resp.status_code}: {resp.text[:250]}")
+
+        data = resp.json()
+        items = sorted(data.get("data", []), key=lambda x: x.get("index", 0))
+        embeddings = [item.get("embedding", []) for item in items if item.get("embedding")]
+        if not embeddings or len(embeddings) != len(input):
+            raise RuntimeError("پاسخ نامعتبر از سرویس Embeddings دریافت شد.")
+        return embeddings
 
 
 @st.cache_resource(show_spinner=False)
@@ -204,50 +258,54 @@ def get_chroma_collection_openai(chroma_dir: str, api_key: str, base_url: str, e
         base_url=base_url,
         model=embed_model,
     )
+    # Bump collection suffix to v2 so any previously poisoned zero-vector cache is cleanly bypassed
+    safe_collection_name = f"{collection_name}_v2"
     try:
         Path(chroma_dir).mkdir(parents=True, exist_ok=True)
         client = chromadb.PersistentClient(path=str(chroma_dir))
-        return client.get_or_create_collection(name=collection_name, embedding_function=ef)
+        return client.get_or_create_collection(name=safe_collection_name, embedding_function=ef)
     except Exception as e:
         logger.warning(f"[ChromaDB] PersistentClient failed ({e}), falling back to EphemeralClient.")
         try:
             client = chromadb.EphemeralClient()
-            return client.get_or_create_collection(name=collection_name, embedding_function=ef)
+            return client.get_or_create_collection(name=safe_collection_name, embedding_function=ef)
         except Exception as inner_err:
             logger.error(f"[ChromaDB] EphemeralClient also failed: {inner_err}")
             return None
 
 
 def format_product_dict_document(product: Dict[str, Any]) -> str:
-    """Format a product JSON object from the API into structured Persian text for RAG retrieval."""
-    stock_val = product.get("stock", 0) or 0
-    in_stock = bool(stock_val > 0) if "stock" in product else bool(product.get("in_stock", True))
-    status_text = "موجود در انبار" if in_stock else "ناموجود"
+    """Format a product JSON object into structured Persian text for RAG retrieval."""
+    in_stock, stock_count = compute_in_stock(product)
+    status_text = f"موجود در انبار ({stock_count} عدد)" if in_stock else "ناموجود"
 
-    price_raw = product.get("price")
-    try:
-        price_int = int(float(price_raw or 0))
-    except (ValueError, TypeError):
-        price_int = 0
+    final_price, original_price, discount_pct = compute_product_pricing(product)
+    if final_price > 0 and discount_pct > 0:
+        price_line = f"{final_price:,} تومان (با {discount_pct}% تخفیف؛ قیمت قبل: {original_price:,} تومان)"
+    elif final_price > 0:
+        price_line = f"{final_price:,} تومان"
+    else:
+        price_line = "تماس بگیرید"
+
+    colors = product.get("colors") or []
+    sizes = [s for s in (product.get("size") or []) if str(s).upper() != "NA"]
 
     doc_lines = [
+        f"شناسه کالا: {product.get('id', '')}",
         f"نام محصول: {product.get('name', 'نامشخص')}",
         f"دسته‌بندی: {product.get('category') or 'عمومی'}",
         f"برند: {product.get('brand') or 'مشخص نشده'}",
-        f"قیمت: {price_int:,} تومان" if price_int > 0 else "قیمت: تماس بگیرید",
+        f"قیمت نهایی فروش: {price_line}",
         f"وضعیت موجودی: {status_text}",
     ]
+    if colors:
+        doc_lines.append(f"رنگ‌های موجود: {'، '.join(str(c) for c in colors)}")
+    if sizes:
+        doc_lines.append(f"سایزبندی: {'، '.join(str(s) for s in sizes)}")
 
-    desc = product.get("description") or ""
+    desc = clean_bbcode(product.get("description") or "")
     if desc:
-        cleaned_desc = (
-            str(desc)
-            .replace("[green]", "")
-            .replace("[/green]", "")
-            .replace("[blue]", "")
-            .replace("[/blue]", "")
-        )
-        doc_lines.append(f"توضیحات و مشخصات تخصصی:\n{cleaned_desc.strip()}")
+        doc_lines.append(f"توضیحات و مشخصات تخصصی:\n{desc}")
 
     return "\n".join(doc_lines)
 
@@ -256,7 +314,6 @@ def fetch_products_from_api(products_api_url: str) -> Tuple[List[Dict[str, Any]]
     """
     Fetch all products from the Django REST API endpoint.
     Supports both DRF paginated responses (`{"results": [...], "next": ...}`) and direct JSON lists.
-    Returns (products_list, error_message).
     """
     if not products_api_url or not products_api_url.strip():
         return [], "آدرس API محصولات (`PRODUCTS_API_URL`) تنظیم نشده است."
@@ -297,10 +354,7 @@ def fetch_products_from_api(products_api_url: str) -> Tuple[List[Dict[str, Any]]
         return all_products, ""
     except requests.exceptions.ConnectTimeout as e:
         logger.warning(f"[Products API] Connection timed out for {products_api_url}: {e}")
-        return [], (
-            f"اتصال Streamlit به {products_api_url} برقرار نشد. "
-            "دسترسی خروجی سرور Streamlit به api.parsinteb.ir و دسترسی عمومی API را بررسی کنید."
-        )
+        return [], f"اتصال مستقیم به {products_api_url} برقرار نشد (Timeout)."
     except requests.exceptions.Timeout as e:
         logger.warning(f"[Products API] Request timed out for {products_api_url}: {e}")
         return [], f"دریافت پاسخ از API محصولات بیش از زمان مجاز طول کشید: {e}"
@@ -325,67 +379,69 @@ def load_fallback_catalog(catalog_path: Path = FALLBACK_CATALOG_PATH) -> List[Di
     return []
 
 
-def sync_products_from_api_to_chroma(
+@st.cache_data(ttl=600, show_spinner=False)
+def get_active_catalog(products_api_url: str) -> Tuple[List[Dict[str, Any]], bool]:
+    """
+    Return `(products_list, used_fallback)` cached for 10 minutes so we always have
+    the full product list in memory for 100% accurate catalog overview + hybrid search.
+    """
+    products, err = fetch_products_from_api(products_api_url)
+    if not err and products:
+        return products, False
+    fallback = load_fallback_catalog()
+    if fallback:
+        return fallback, True
+    return [], False
+
+
+def build_product_metadata(prod: Dict[str, Any], idx: int, frontend_url: str = "") -> Dict[str, Any]:
+    prod_id = prod.get("id", prod.get("product_id", idx + 1))
+    try:
+        prod_id_int = int(prod_id)
+    except (ValueError, TypeError):
+        prod_id_int = idx + 1
+
+    final_price, original_price, discount_pct = compute_product_pricing(prod)
+    in_stock, stock_count = compute_in_stock(prod)
+
+    clean_frontend = (frontend_url or "").strip().rstrip("/")
+    rel_url = f"/products/{prod_id_int}"
+    full_url = f"{clean_frontend}{rel_url}" if clean_frontend else str(prod.get("url") or rel_url)
+
+    return {
+        "product_id": prod_id_int,
+        "name": str(prod.get("name") or "محصول بدون نام"),
+        "category": str(prod.get("category") or ""),
+        "brand": str(prod.get("brand") or ""),
+        "price": final_price,
+        "original_price": original_price,
+        "discount_percent": discount_pct,
+        "in_stock": in_stock,
+        "stock": stock_count,
+        "url": full_url,
+    }
+
+
+def sync_products_to_chroma(
     collection,
-    products_api_url: str,
+    products: List[Dict[str, Any]],
     frontend_url: str = "",
 ) -> Tuple[int, str]:
-    """Fetch products from `PRODUCTS_API_URL` (with automatic fallback to `data/products_catalog.json`) and upsert into ChromaDB."""
+    """Batch-upsert products into ChromaDB with real OpenAI embeddings."""
     if collection is None:
         return 0, "پایگاه برداری ChromaDB آماده نیست."
-
-    products, err = fetch_products_from_api(products_api_url)
-    used_fallback = False
-    if err or not products:
-        fallback_products = load_fallback_catalog()
-        if fallback_products:
-            products = fallback_products
-            used_fallback = True
-            logger.info(f"[ChromaDB Sync] Loaded {len(products)} products from local fallback catalog.")
-        else:
-            return 0, err or "هیچ محصولی از آدرس API دریافت نشد."
+    if not products:
+        return 0, "لیست محصولات خالی است."
 
     ids: List[str] = []
     documents: List[str] = []
     metadatas: List[Dict[str, Any]] = []
-    clean_frontend = (frontend_url or "").strip().rstrip("/")
 
     for idx, prod in enumerate(products):
-        prod_id = prod.get("id", prod.get("product_id", idx + 1))
-        try:
-            prod_id_int = int(prod_id)
-        except (ValueError, TypeError):
-            prod_id_int = idx + 1
-
-        price_raw = prod.get("price", 0)
-        try:
-            price_val = int(float(price_raw or 0))
-        except (ValueError, TypeError):
-            price_val = 0
-
-        stock_raw = prod.get("stock", 0)
-        if "stock" in prod:
-            try:
-                in_stock = int(stock_raw or 0) > 0
-            except (ValueError, TypeError):
-                in_stock = bool(stock_raw)
-        else:
-            in_stock = bool(prod.get("in_stock", True))
-
-        rel_url = f"/products/{prod_id_int}"
-        full_url = f"{clean_frontend}{rel_url}" if clean_frontend else prod.get("url", rel_url)
-
-        ids.append(str(prod_id_int))
+        meta = build_product_metadata(prod, idx, frontend_url)
+        ids.append(str(meta["product_id"]))
         documents.append(format_product_dict_document(prod))
-        metadatas.append({
-            "product_id": prod_id_int,
-            "name": str(prod.get("name") or "محصول بدون نام"),
-            "category": str(prod.get("category") or ""),
-            "brand": str(prod.get("brand") or ""),
-            "price": price_val,
-            "in_stock": in_stock,
-            "url": str(full_url),
-        })
+        metadatas.append(meta)
 
     try:
         batch_size = 50
@@ -396,39 +452,139 @@ def sync_products_from_api_to_chroma(
                 documents=documents[start:end],
                 metadatas=metadatas[start:end],
             )
-        info_note = (
-            "ℹ️ ارتباط مستقیم سرور ابری با `api.parsinteb.ir` محدود بود؛ کاتالوگ پشتیبان داخلی بارگذاری شد."
-            if used_fallback
-            else ""
-        )
-        return len(ids), info_note
+        return len(ids), ""
     except Exception as e:
         logger.error(f"[ChromaDB Sync] Upsert failed: {e}")
-        return 0, f"خطا در ثبت بردارهای محصولات: {e}"
+        return 0, f"خطا در بردارسازی محصولات با OpenAI: {e}"
 
 
-def query_products_standalone(collection, query_text: str, n_results: int = 2) -> List[Dict[str, Any]]:
-    """Retrieve top semantic product matches from ChromaDB."""
-    if collection is None:
-        return []
-    try:
-        results = collection.query(query_texts=[query_text], n_results=n_results)
-        matched = []
-        if results and results.get("documents") and len(results["documents"]) > 0:
-            docs = results["documents"][0]
-            metas = results.get("metadatas", [[]])[0]
-            for doc, meta in zip(docs, metas):
-                matched.append({
-                    "document": doc,
-                    "metadata": meta,
-                })
-        return matched
-    except Exception:
-        return []
+def build_catalog_overview_index(products: List[Dict[str, Any]]) -> str:
+    """
+    Build a concise 1-line-per-product inventory summary of ALL store products.
+    With ~25-80 products, this costs very few tokens and guarantees the LLM has
+    complete visibility over every item, category, brand, exact price, and stock!
+    """
+    if not products:
+        return "اطلاعات فهرست کلی کالاها در دسترس نیست."
+
+    lines = []
+    for idx, p in enumerate(products, 1):
+        final_price, orig_price, disc = compute_product_pricing(p)
+        in_stock, stock_cnt = compute_in_stock(p)
+        price_txt = f"{final_price:,} تومان" if final_price > 0 else "تماس بگیرید"
+        if disc > 0:
+            price_txt += f" ({disc}% تخفیف از {orig_price:,})"
+        stock_txt = f"موجود ({stock_cnt} عدد)" if in_stock else "ناموجود"
+        name = p.get("name", "بدون نام")
+        cat = p.get("category") or "عمومی"
+        brand = p.get("brand") or "-"
+        lines.append(f"{idx}. {name} | دسته: {cat} | برند: {brand} | قیمت: {price_txt} | وضعیت: {stock_txt}")
+    return "\n".join(lines)
+
+
+def hybrid_search_products(
+    collection,
+    all_products: List[Dict[str, Any]],
+    query_text: str,
+    n_results: int = 5,
+    frontend_url: str = "",
+) -> List[Dict[str, Any]]:
+    """
+    Combine Persian lexical/keyword matching across all products with ChromaDB semantic vector search
+    so exact product/category/brand queries NEVER miss any relevant items.
+    """
+    norm_q = normalize_persian(query_text)
+    q_tokens = [t for t in re.findall(r"\w+", norm_q) if len(t) >= 2 and t not in CONTEXTUAL_TRIGGERS]
+
+    # 1. Lexical score over full catalog
+    lexical_hits: List[Tuple[float, Dict[str, Any]]] = []
+    prod_by_id: Dict[int, Dict[str, Any]] = {}
+
+    for idx, prod in enumerate(all_products):
+        meta = build_product_metadata(prod, idx, frontend_url)
+        pid = meta["product_id"]
+        prod_by_id[pid] = {
+            "document": format_product_dict_document(prod),
+            "metadata": meta,
+        }
+
+        name_norm = normalize_persian(prod.get("name", ""))
+        cat_norm = normalize_persian(prod.get("category", ""))
+        brand_norm = normalize_persian(prod.get("brand", ""))
+        desc_norm = normalize_persian(clean_bbcode(prod.get("description", "")))
+
+        score = 0.0
+        if norm_q and norm_q in name_norm:
+            score += 8.0
+        for tok in q_tokens:
+            if tok in name_norm:
+                score += 4.0
+            if tok in cat_norm:
+                score += 3.5
+            if tok in brand_norm:
+                score += 3.0
+            if tok in desc_norm:
+                score += 1.0
+        if score > 0:
+            lexical_hits.append((score, prod_by_id[pid]))
+
+    lexical_hits.sort(key=lambda x: x[0], reverse=True)
+
+    # 2. Vector semantic search from ChromaDB
+    vector_hits: List[Dict[str, Any]] = []
+    if collection is not None:
+        try:
+            total_in_col = collection.count()
+            k = min(max(n_results, 5), total_in_col) if total_in_col > 0 else 0
+            if k > 0:
+                results = collection.query(query_texts=[query_text], n_results=k)
+                if results and results.get("documents") and len(results["documents"]) > 0:
+                    docs = results["documents"][0]
+                    metas = results.get("metadatas", [[]])[0]
+                    for doc, meta in zip(docs, metas):
+                        pid = int(meta.get("product_id", 0)) if meta else 0
+                        if pid in prod_by_id:
+                            vector_hits.append(prod_by_id[pid])
+                        else:
+                            vector_hits.append({"document": doc, "metadata": meta})
+        except Exception as e:
+            logger.warning(f"[Hybrid Search] Vector query error: {e}")
+
+    # 3. Merge deduplicated: strong lexical matches first, then semantic vector matches
+    merged: List[Dict[str, Any]] = []
+    seen_ids = set()
+
+    for score, item in lexical_hits:
+        if score >= 3.0:
+            pid = item["metadata"].get("product_id")
+            if pid not in seen_ids:
+                seen_ids.add(pid)
+                merged.append(item)
+            if len(merged) >= n_results:
+                break
+
+    for item in vector_hits:
+        if len(merged) >= n_results:
+            break
+        pid = item["metadata"].get("product_id")
+        if pid not in seen_ids:
+            seen_ids.add(pid)
+            merged.append(item)
+
+    # Fill remaining slots with lower-score lexical hits if needed
+    for _, item in lexical_hits:
+        if len(merged) >= n_results:
+            break
+        pid = item["metadata"].get("product_id")
+        if pid not in seen_ids:
+            seen_ids.add(pid)
+            merged.append(item)
+
+    return merged[:n_results]
 
 
 # ── LangChain OpenAI Helpers ─────────────────────────────────────────────────
-def get_llm(api_key: str, base_url: str, model_name: str, temperature: float, max_tokens: int = 250) -> ChatOpenAI:
+def get_llm(api_key: str, base_url: str, model_name: str, temperature: float, max_tokens: int = 600) -> ChatOpenAI:
     kwargs = {
         "model": model_name,
         "api_key": api_key or "missing-openai-api-key",
@@ -453,8 +609,8 @@ def contextualize_query(user_message: str, chat_history: List[BaseMessage], llm_
     try:
         rephrase_prompt = ChatPromptTemplate.from_messages([
             ("system", (
-                "با توجه به سابقه پیام‌ها، پرسش کوتاه کاربر را به یک عبارت جستجوی کوتاه (حداکثر ۵ کلمه) "
-                "برای جستجوی انبار کالا تبدیل کنید. فقط عبارت جستجو را بدون هیچ توضیح اضافه‌ای بنویسید."
+                "با توجه به سابقه پیام‌ها، پرسش کوتاه کاربر را به یک عبارت جستجوی دقیق و کوتاه (حداکثر ۶ کلمه شامل نام یا دسته کالا) "
+                "برای جستجوی انبار تجهیزات پزشکی تبدیل کنید. فقط عبارت جستجو را بدون هیچ توضیح اضافه‌ای بنویسید."
             )),
             MessagesPlaceholder("chat_history"),
             ("human", "{input}"),
@@ -473,9 +629,9 @@ def render_product_badges(matches: List[Dict[str, Any]], frontend_url: str = "")
     if not matches:
         return
     st.markdown("##### 🛍️ کالاهای مرتبط در انبار:")
-    cols = st.columns(len(matches))
+    cols = st.columns(min(len(matches), 4))
     clean_frontend = (frontend_url or "").strip().rstrip("/")
-    for idx, item in enumerate(matches):
+    for idx, item in enumerate(matches[:4]):
         with cols[idx]:
             price_val = item.get("price", 0)
             price_str = f"{to_persian_digits(f'{price_val:,}')} تومان" if price_val else "تماس بگیرید"
@@ -516,7 +672,7 @@ secret_products_api_url, products_url_in_secrets = get_secret(
     "PRODUCTS_API_URL",
     default_products_api_url,
 )
-secret_frontend_url, _ = get_secret("FRONTEND_URL", "")
+secret_frontend_url, _ = get_secret("FRONTEND_URL", "https://parsinteb.ir")
 
 # ── Sidebar UI & Diagnostics ─────────────────────────────────────────────────
 with st.sidebar:
@@ -573,8 +729,8 @@ with st.sidebar:
         index=default_embed_idx
     )
 
-    temperature = st.slider("درجه خلاقیت (Temperature)", min_value=0.0, max_value=1.0, value=0.2, step=0.05)
-    n_results = st.slider("تعداد کالاهای مرتبط در پاسخ", min_value=1, max_value=4, value=2)
+    temperature = st.slider("درجه خلاقیت (Temperature)", min_value=0.0, max_value=1.0, value=0.1, step=0.05)
+    n_results = st.slider("تعداد کالاهای بررسی تخصصی در هر پاسخ", min_value=2, max_value=8, value=5)
 
     st.markdown("---")
     st.markdown("### 📊 وضعیت سرویس‌ها")
@@ -585,6 +741,9 @@ with st.sidebar:
     else:
         st.error("🔴 کلید OpenAI: وارد نشده است (`OPENAI_API_KEY`)")
 
+    # Load full active product catalog (live API or bundled JSON fallback)
+    all_catalog_products, used_fallback_catalog = get_active_catalog(products_api_url)
+
     collection = get_chroma_collection_openai(
         str(DEFAULT_CHROMA_DIR),
         openai_api_key,
@@ -593,26 +752,23 @@ with st.sidebar:
         secret_collection_name,
     )
 
-    # Auto-sync on first startup if collection is empty and OPENAI_API_KEY is set
+    # Auto-sync ChromaDB if collection is empty or has fewer items than the catalog
     if (
         collection is not None
         and openai_api_key.strip()
-        and (products_api_url.strip() or FALLBACK_CATALOG_PATH.exists())
+        and all_catalog_products
         and not st.session_state.get("initial_api_sync_attempted", False)
     ):
         try:
-            if collection.count() == 0:
+            if collection.count() < len(all_catalog_products):
                 st.session_state["initial_api_sync_attempted"] = True
-                with st.spinner("🔄 در حال دریافت و بردارسازی کاتالوگ محصولات از سرور..."):
-                    synced_count, sync_err = sync_products_from_api_to_chroma(
+                with st.spinner("🔄 در حال بردارسازی کامل کاتالوگ محصولات با OpenAI..."):
+                    synced_count, sync_err = sync_products_to_chroma(
                         collection,
-                        products_api_url,
+                        all_catalog_products,
                         secret_frontend_url,
                     )
-                    if sync_err and synced_count == 0:
-                        st.session_state["last_sync_error"] = sync_err
-                    else:
-                        st.session_state["last_sync_error"] = sync_err  # empty or fallback info note
+                    st.session_state["last_sync_error"] = sync_err
         except Exception as e:
             st.session_state["last_sync_error"] = str(e)
 
@@ -622,33 +778,36 @@ with st.sidebar:
             product_count = collection.count()
             if product_count > 0:
                 st.success(f"🟢 پایگاه برداری OpenAI: {to_persian_digits(product_count)} محصول ثبت‌شده")
+            elif all_catalog_products:
+                st.info(f"🟡 کاتالوگ بارگذاری شد ({to_persian_digits(len(all_catalog_products))} محصول)؛ آماده همگام‌سازی برداری.")
             else:
-                st.warning("🟡 پایگاه برداری خالی است (۰ محصول). دکمه همگام‌سازی را بزنید.")
+                st.warning("🟡 هیچ محصولی یافت نشد.")
         except Exception:
             st.warning("⚠️ خطا در خواندن پایگاه برداری OpenAI")
     else:
         st.error("🔴 خطا در راه‌اندازی پایگاه برداری ChromaDB.")
 
+    if used_fallback_catalog:
+        st.caption("ℹ️ منبع داده: کاتالوگ داخلی مخزن (`products_catalog.json` — ۲۵ محصول پارسین طب)")
+
     if st.session_state.get("last_sync_error"):
-        msg_note = st.session_state["last_sync_error"]
-        if msg_note.startswith("ℹ️"):
-            st.caption(msg_note)
-        else:
-            st.caption(f"⚠️ نتیجه آخرین همگام‌سازی: {msg_note}")
+        st.caption(f"⚠️ پیام همگام‌سازی برداری: {st.session_state['last_sync_error']}")
 
     if products_api_url.strip() or FALLBACK_CATALOG_PATH.exists():
-        if st.button("🔄 همگام‌سازی محصولات", use_container_width=True):
-            with st.spinner("در حال دریافت محصولات و بروزرسانی پایگاه برداری..."):
-                synced_count, sync_err = sync_products_from_api_to_chroma(
+        if st.button("🔄 بروزرسانی و همگام‌سازی محصولات", use_container_width=True):
+            get_active_catalog.clear()
+            refreshed_products, _ = get_active_catalog(products_api_url)
+            with st.spinner("در حال بردارسازی مجدد تمامی محصولات در ChromaDB..."):
+                synced_count, sync_err = sync_products_to_chroma(
                     collection,
-                    products_api_url,
+                    refreshed_products,
                     secret_frontend_url,
                 )
                 if sync_err and synced_count == 0:
                     st.session_state["last_sync_error"] = sync_err
                     st.error(f"❌ خطا در همگام‌سازی: {sync_err}")
                 else:
-                    st.session_state["last_sync_error"] = sync_err
+                    st.session_state["last_sync_error"] = ""
                     st.toast(f"✅ {to_persian_digits(synced_count)} محصول با موفقیت همگام‌سازی شد!")
                     st.rerun()
 
@@ -657,12 +816,18 @@ with st.sidebar:
         st.session_state.messages = []
         st.rerun()
 
-    with st.expander("🔍 تست جستجوی برداری کاتالوگ (OpenAI)"):
-        search_test = st.text_input("جستجوی مفهومی محصول:", placeholder="مثال: اکسیژن ساز خانگی")
-        if search_test and collection is not None:
-            results = query_products_standalone(collection, search_test, n_results=2)
+    with st.expander("🔍 تست جستجوی ترکیبی کاتالوگ"):
+        search_test = st.text_input("جستجوی مفهومی یا نام محصول:", placeholder="مثال: فشارسنج یا بخور سرد")
+        if search_test:
+            results = hybrid_search_products(
+                collection,
+                all_catalog_products,
+                search_test,
+                n_results=4,
+                frontend_url=secret_frontend_url,
+            )
             for r in results:
-                m = r['metadata']
+                m = r["metadata"]
                 p_val = m.get("price", 0)
                 st.caption(f"🛍️ **{m.get('name')}** - {to_persian_digits(f'{p_val:,}')} تومان")
 
@@ -671,7 +836,7 @@ with st.sidebar:
 st.markdown("""
 <div class="app-header">
     <h1>🩺 مشاور هوشمند تجهیزات پزشکی پارسین طب (نسخه OpenAI)</h1>
-    <p>پاسخ‌گویی تخصصی به سوالات پزشکی، راهنمایی خرید و استعلام موجودی و قیمت تجهیزات</p>
+    <p>پاسخ‌گویی تخصصی به سوالات پزشکی، راهنمایی خرید و استعلام دقیق موجودی و قیمت تمامی تجهیزات</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -679,7 +844,7 @@ if "messages" not in st.session_state:
     st.session_state.messages = [
         {
             "role": "assistant",
-            "content": "سلام! من مشاور هوشمند تجهیزات پزشکی پارسین طب هستم. در خصوص بررسی، مشخصات یا قیمت دستگاه‌های پزشکی و درمانی در خدمتم.",
+            "content": "سلام! من مشاور هوشمند تجهیزات پزشکی پارسین طب هستم. به تمامی محصولات، قیمت‌های روز و مشخصات فنی انبار دسترسی کامل دارم؛ چطور می‌توانم راهنمایی‌تان کنم؟",
             "matches": []
         }
     ]
@@ -704,26 +869,34 @@ if user_prompt := st.chat_input("پرسش پزشکی یا نام محصول مو
 
     st.session_state.messages.append({"role": "user", "content": user_prompt})
 
-    llm_fast = get_llm(openai_api_key, openai_base_url, model_name, temperature=0.1, max_tokens=40)
+    llm_fast = get_llm(openai_api_key, openai_base_url, model_name, temperature=0.0, max_tokens=50)
     search_query = contextualize_query(user_prompt, history_langchain, llm_fast)
 
-    matched_products = query_products_standalone(collection, search_query, n_results=n_results)
+    matched_products = hybrid_search_products(
+        collection,
+        all_catalog_products,
+        search_query,
+        n_results=n_results,
+        frontend_url=secret_frontend_url,
+    )
     matches_metadata = [m.get("metadata", {}) for m in matched_products if m.get("metadata")]
 
     context_docs = [m.get("document", "") for m in matched_products if m.get("document")]
-    catalog_context = "\n---\n".join(context_docs) if context_docs else "محصول مستقیمی یافت نشد."
+    detailed_matches_context = "\n\n---\n\n".join(context_docs) if context_docs else "مورد تخصصی مستقیمی یافت نشد."
+    full_inventory_overview = build_catalog_overview_index(all_catalog_products)
 
     system_instruction = (
         "شما «مشاور هوشمند و تخصصی تجهیزات پزشکی پارسین طب (مدی کالا)» هستید.\n"
-        "وظیفه شما راهنمایی دقیق، علمی و صمیمانه به کاربران در انتخاب بهترین تجهیزات پزشکی است.\n\n"
-        "دستورالعمل‌های پاسخ‌دهی:\n"
-        "۱. به پرسش کاربر مستقیماً و بر اساس اطلاعات فنی محصولات انبار (در زیر) پاسخ دهید.\n"
-        "۲. پاسخ را مختصر، علمی و کاربردی بنویسید (حدود ۲ الی ۴ جمله مفید و کامل).\n"
-        "۳. نام کالا، برند و قیمت به تومان را ذکر کنید.\n"
-        "۴. نیازی به نوشتن لینک صفحه محصول نیست، کارت‌های کالا به صورت خودکار زیر پاسخ به کاربر نمایش داده می‌شوند.\n"
+        "وظیفه شما راهنمایی دقیق، علمی و کاملاً مستند به کاتالوگ واقعی فروشگاه است.\n\n"
+        "قوانین بسیار مهم (حتماً رعایت کنید):\n"
+        "۱. **صرفاً بر اساس اطلاعات واقعی زیر پاسخ دهید**؛ هرگز نام محصول، برند، ویژگی فنی یا قیمتی را از خودتان حدس نزنید یا نسازید.\n"
+        "۲. شما به «فهرست کامل تمامی کالاهای موجود در فروشگاه» و همچنین «مشخصات فنی کامل کالاهای مرتبط» دسترسی دارید. اگر کاربر درباره دسته‌ای از محصولات (مثل همه فشارسنج‌ها، همه بخورها، شیردوش‌ها، ماساژورها یا ارزان‌ترین/گران‌ترین کالا) پرسید، **همه موارد مرتبط موجود در فهرست کامل فروشگاه** را به طور دقیق معرفی کنید.\n"
+        "۳. نام دقیق کالا، برند، وضعیت موجودی و قیمت دقیق به تومان را عیناً مطابق اطلاعات درج‌شده بیان کنید.\n"
+        "۴. نیازی به نوشتن لینک نیست؛ کارت‌های محصولات به صورت خودکار زیر پاسخ نمایش داده می‌شوند.\n"
         "۵. ارسال سفارش‌ها در شهر رشت فوری و برای سایر شهرها با پست پیشتاز انجام می‌شود.\n"
-        "۶. اگر محصول مورد نظر کاربر در انبار نبود، صریحاً اعلام کنید و نزدیک‌ترین جایگزین را پیشنهاد دهید.\n\n"
-        f"اطلاعات انبار و مشخصات کالاها:\n{catalog_context}"
+        "۶. اگر کالای درخواستی کاربر اصلاً در فهرست کل محصولات فروشگاه وجود نداشت، صریحاً اعلام کنید که فعلاً در انبار موجود نیست و نزدیک‌ترین کالاهای موجود در فهرست را پیشنهاد دهید.\n\n"
+        f"=== بخش اول: مشخصات فنی کامل کالاهای منتخب مرتبط با پرسش ===\n{detailed_matches_context}\n\n"
+        f"=== بخش دوم: فهرست کامل تمامی محصولات، قیمت‌ها و موجودی فروشگاه پارسین طب ===\n{full_inventory_overview}"
     )
 
     qa_prompt = ChatPromptTemplate.from_messages([
@@ -732,7 +905,7 @@ if user_prompt := st.chat_input("پرسش پزشکی یا نام محصول مو
         ("human", "{input}"),
     ])
 
-    llm = get_llm(openai_api_key, openai_base_url, model_name, temperature=temperature, max_tokens=250)
+    llm = get_llm(openai_api_key, openai_base_url, model_name, temperature=temperature, max_tokens=650)
     chain = qa_prompt | llm
 
     with st.chat_message("assistant", avatar="🩺"):
