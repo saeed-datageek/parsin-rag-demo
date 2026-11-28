@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import sys
@@ -130,6 +131,7 @@ st.markdown("""
 
 # ── Paths & Defaults ─────────────────────────────────────────────────────────
 DEFAULT_CHROMA_DIR = BASE_DIR / "data" / "chroma_db"
+FALLBACK_CATALOG_PATH = BASE_DIR / "data" / "products_catalog.json"
 CONTEXTUAL_TRIGGERS = {
     'این', 'اون', 'آن', 'همین', 'کدوم', 'کدام', 'قیمتش', 'چنده',
     'چند', 'قیمت', 'گارانتی', 'هزینه', 'موجوده', 'موجود', 'داره',
@@ -271,8 +273,11 @@ def fetch_products_from_api(products_api_url: str) -> Tuple[List[Dict[str, Any]]
             visited_urls.add(url)
             resp = requests.get(
                 url,
-                headers={"Accept": "application/json"},
-                timeout=20,
+                headers={
+                    "Accept": "application/json",
+                    "User-Agent": "Mozilla/5.0 (compatible; ParsinTebRAG/1.0)",
+                },
+                timeout=8,
             )
             if not resp.ok:
                 return [], f"خطای HTTP {resp.status_code} از سرور محصولات ({url})"
@@ -290,9 +295,34 @@ def fetch_products_from_api(products_api_url: str) -> Tuple[List[Dict[str, Any]]
                 break
 
         return all_products, ""
+    except requests.exceptions.ConnectTimeout as e:
+        logger.warning(f"[Products API] Connection timed out for {products_api_url}: {e}")
+        return [], (
+            f"اتصال Streamlit به {products_api_url} برقرار نشد. "
+            "دسترسی خروجی سرور Streamlit به api.parsinteb.ir و دسترسی عمومی API را بررسی کنید."
+        )
+    except requests.exceptions.Timeout as e:
+        logger.warning(f"[Products API] Request timed out for {products_api_url}: {e}")
+        return [], f"دریافت پاسخ از API محصولات بیش از زمان مجاز طول کشید: {e}"
     except Exception as e:
         logger.warning(f"[Products API] Failed to fetch from {products_api_url}: {e}")
         return [], str(e)
+
+
+def load_fallback_catalog(catalog_path: Path = FALLBACK_CATALOG_PATH) -> List[Dict[str, Any]]:
+    """Load bundled fallback product catalog JSON when remote API is unreachable from cloud."""
+    try:
+        if catalog_path.exists():
+            data = json.loads(catalog_path.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                return [item for item in data if isinstance(item, dict)]
+            if isinstance(data, dict):
+                results = data.get("results", data.get("data", []))
+                if isinstance(results, list):
+                    return [item for item in results if isinstance(item, dict)]
+    except Exception as e:
+        logger.warning(f"[Fallback Catalog] Failed to read {catalog_path}: {e}")
+    return []
 
 
 def sync_products_from_api_to_chroma(
@@ -300,15 +330,20 @@ def sync_products_from_api_to_chroma(
     products_api_url: str,
     frontend_url: str = "",
 ) -> Tuple[int, str]:
-    """Fetch products from `PRODUCTS_API_URL` and batch-upsert them into ChromaDB."""
+    """Fetch products from `PRODUCTS_API_URL` (with automatic fallback to `data/products_catalog.json`) and upsert into ChromaDB."""
     if collection is None:
         return 0, "پایگاه برداری ChromaDB آماده نیست."
 
     products, err = fetch_products_from_api(products_api_url)
-    if err:
-        return 0, err
-    if not products:
-        return 0, "هیچ محصولی از آدرس API دریافت نشد."
+    used_fallback = False
+    if err or not products:
+        fallback_products = load_fallback_catalog()
+        if fallback_products:
+            products = fallback_products
+            used_fallback = True
+            logger.info(f"[ChromaDB Sync] Loaded {len(products)} products from local fallback catalog.")
+        else:
+            return 0, err or "هیچ محصولی از آدرس API دریافت نشد."
 
     ids: List[str] = []
     documents: List[str] = []
@@ -361,7 +396,12 @@ def sync_products_from_api_to_chroma(
                 documents=documents[start:end],
                 metadatas=metadatas[start:end],
             )
-        return len(ids), ""
+        info_note = (
+            "ℹ️ ارتباط مستقیم سرور ابری با `api.parsinteb.ir` محدود بود؛ کاتالوگ پشتیبان داخلی بارگذاری شد."
+            if used_fallback
+            else ""
+        )
+        return len(ids), info_note
     except Exception as e:
         logger.error(f"[ChromaDB Sync] Upsert failed: {e}")
         return 0, f"خطا در ثبت بردارهای محصولات: {e}"
@@ -470,7 +510,12 @@ secret_base_url, base_in_secrets = get_secret("OPENAI_BASE_URL", "https://api.op
 secret_model, _ = get_secret("OPENAI_MODEL", "gpt-4o-mini")
 secret_embed_model, _ = get_secret("OPENAI_EMBED_MODEL", "text-embedding-3-small")
 secret_collection_name, _ = get_secret("OPENAI_CHROMA_COLLECTION", "medical_products_openai")
-secret_products_api_url, products_url_in_secrets = get_secret("PRODUCTS_API_URL", "")
+secret_api_base, _ = get_secret("VITE_API_BASE", "https://api.parsinteb.ir")
+default_products_api_url = f"{secret_api_base.rstrip('/')}/shop/products/"
+secret_products_api_url, products_url_in_secrets = get_secret(
+    "PRODUCTS_API_URL",
+    default_products_api_url,
+)
 secret_frontend_url, _ = get_secret("FRONTEND_URL", "")
 
 # ── Sidebar UI & Diagnostics ─────────────────────────────────────────────────
@@ -502,7 +547,7 @@ with st.sidebar:
         products_api_url = st.text_input(
             "آدرس API محصولات (PRODUCTS_API_URL)",
             value=secret_products_api_url,
-            placeholder="https://parsinteb.com/api/products/",
+            placeholder="https://api.parsinteb.ir/shop/products/",
             help="آدرس اندپوینت محصولات بک‌اند برای همگام‌سازی خودکار ChromaDB"
         )
 
@@ -548,11 +593,11 @@ with st.sidebar:
         secret_collection_name,
     )
 
-    # Auto-sync on first startup if collection is empty and PRODUCTS_API_URL + OPENAI_API_KEY are set
+    # Auto-sync on first startup if collection is empty and OPENAI_API_KEY is set
     if (
         collection is not None
         and openai_api_key.strip()
-        and products_api_url.strip()
+        and (products_api_url.strip() or FALLBACK_CATALOG_PATH.exists())
         and not st.session_state.get("initial_api_sync_attempted", False)
     ):
         try:
@@ -564,10 +609,10 @@ with st.sidebar:
                         products_api_url,
                         secret_frontend_url,
                     )
-                    if sync_err:
+                    if sync_err and synced_count == 0:
                         st.session_state["last_sync_error"] = sync_err
                     else:
-                        st.session_state["last_sync_error"] = ""
+                        st.session_state["last_sync_error"] = sync_err  # empty or fallback info note
         except Exception as e:
             st.session_state["last_sync_error"] = str(e)
 
@@ -585,21 +630,25 @@ with st.sidebar:
         st.error("🔴 خطا در راه‌اندازی پایگاه برداری ChromaDB.")
 
     if st.session_state.get("last_sync_error"):
-        st.caption(f"⚠️ نتیجه آخرین همگام‌سازی: {st.session_state['last_sync_error']}")
+        msg_note = st.session_state["last_sync_error"]
+        if msg_note.startswith("ℹ️"):
+            st.caption(msg_note)
+        else:
+            st.caption(f"⚠️ نتیجه آخرین همگام‌سازی: {msg_note}")
 
-    if products_api_url.strip():
-        if st.button("🔄 همگام‌سازی محصولات از سرور", use_container_width=True):
-            with st.spinner("در حال دریافت محصولات از سرور و بروزرسانی پایگاه برداری..."):
+    if products_api_url.strip() or FALLBACK_CATALOG_PATH.exists():
+        if st.button("🔄 همگام‌سازی محصولات", use_container_width=True):
+            with st.spinner("در حال دریافت محصولات و بروزرسانی پایگاه برداری..."):
                 synced_count, sync_err = sync_products_from_api_to_chroma(
                     collection,
                     products_api_url,
                     secret_frontend_url,
                 )
-                if sync_err:
+                if sync_err and synced_count == 0:
                     st.session_state["last_sync_error"] = sync_err
                     st.error(f"❌ خطا در همگام‌سازی: {sync_err}")
                 else:
-                    st.session_state["last_sync_error"] = ""
+                    st.session_state["last_sync_error"] = sync_err
                     st.toast(f"✅ {to_persian_digits(synced_count)} محصول با موفقیت همگام‌سازی شد!")
                     st.rerun()
 
